@@ -11,6 +11,7 @@
  *  GET  /api/stats            ← summary statistics
  *  GET  /api/devices          ← list of seen devices
  *  DELETE /api/violations     ← clear all records (admin)
+ *  POST /api/test-sms         ← backend SMS test endpoint
  *
  *  GET  /                     ← live web dashboard
  *
@@ -196,6 +197,22 @@ app.delete('/api/violations', (req, res) => {
   return res.json({ ok: true, message: 'All violations deleted' });
 });
 
+// POST /api/test-sms (Simulated SMS endpoint for the dashboard)
+app.post('/api/test-sms', (req, res) => {
+  const { phone, message } = req.body;
+  if (!phone || !message) {
+    return res.status(400).json({ ok: false, error: 'Missing phone number or message' });
+  }
+
+  // TODO: Implement actual SMS provider integration here (e.g. Twilio, Nexmo, Telegram)
+  // Or queue it in the SQLite DB for the ESP32 to fetch later.
+  console.log(`\n[SMS API] Simulated SMS triggered!`);
+  console.log(`[SMS API]  ├─ To:   ${phone}`);
+  console.log(`[SMS API]  └─ Text: ${message}\n`);
+
+  return res.json({ ok: true, message: 'SMS request simulated successfully (check terminal logs)' });
+});
+
 // ══════════════════════════════════════════════════════════
 //  DASHBOARD  (served at GET /)
 // ══════════════════════════════════════════════════════════
@@ -310,11 +327,22 @@ function getDashboardHTML() {
   </table>
 </div>
 
+<!-- Backend SMS Tester -->
+<div class="section">
+  <h2>Backend SMS Tester (Simulation)</h2>
+  <div class="toolbar" style="padding:0; margin-bottom: 20px;">
+    <input id="smsPhone" placeholder="+234..." type="text">
+    <input id="smsMsg" placeholder="Message content" style="width:300px;" type="text">
+    <button onclick="sendBackendSMS()" style="background:#1f6feb;">&#x1F4E4; Send Backend SMS</button>
+  </div>
+</div>
+
 <div style="padding:16px 24px;color:#6e7681;font-size:.75rem">
   API: &nbsp;
   <a href="/api/violations" style="color:#58a6ff">/api/violations</a> &nbsp;
   <a href="/api/stats" style="color:#58a6ff">/api/stats</a> &nbsp;
-  <a href="/api/devices" style="color:#58a6ff">/api/devices</a>
+  <a href="/api/devices" style="color:#58a6ff">/api/devices</a> &nbsp;
+  <a href="#" style="color:#58a6ff" title="POST {phone, message}">/api/test-sms</a>
 </div>
 
 <script>
@@ -406,6 +434,31 @@ async function clearAll() {
 }
 
 function loadAll() { loadStats(); loadViolations(); }
+
+async function sendBackendSMS() {
+  const phone = document.getElementById('smsPhone').value.trim();
+  const msg   = document.getElementById('smsMsg').value.trim();
+  if (!phone || !msg) {
+    alert('Missing phone number or message text');
+    return;
+  }
+  try {
+    const res = await fetch('/api/test-sms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, message: msg })
+    });
+    const data = await res.json();
+    if (data.ok) {
+      alert('Backend SMS simulated successfully! Check server terminal logs.');
+      document.getElementById('smsMsg').value = '';
+    } else {
+      alert('Failed: ' + data.error);
+    }
+  } catch (err) {
+    alert('Network error sending request');
+  }
+}
 
 // Initial load + auto-refresh
 loadAll();
