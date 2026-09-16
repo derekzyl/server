@@ -1,6 +1,6 @@
 /**
  * ============================================================
- *  Velocis Server  v3.0
+ *  Velocis Server  v3.1
  *  Node.js + Express + SQLite
  *
  *  Endpoints
@@ -23,11 +23,16 @@
  *  GET    /api/health                 ← uptime / db ping
  *  DELETE /api/violations             ← clear all (admin)
  *  POST   /api/test-sms               ← SMS simulation
- *  GET    /                           ← live dashboard
+ *  POST   /api/login                  ← dashboard session (admin|viewer)
+ *  POST   /api/logout                 ← clear session cookie
+ *  GET    /api/me                     ← { ok, role }
+ *  GET    /                           ← live dashboard (or login)
  *
  *  Config (.env):
  *    PORT=3000
  *    ADMIN_KEY=changeme
+ *    VIEWER_KEY=viewer
+ *    DASHBOARD_AUTH=false
  *    DB_FILE=./violations.db
  *    REQUIRE_AUTH=false
  *    DEVICE_API_KEY=
@@ -49,6 +54,8 @@ const Database = require('better-sqlite3');
 
 const PORT              = process.env.PORT      || 3000;
 const ADMIN_KEY         = process.env.ADMIN_KEY || 'changeme';
+const VIEWER_KEY        = process.env.VIEWER_KEY || 'viewer';
+const DASHBOARD_AUTH    = String(process.env.DASHBOARD_AUTH || 'false').toLowerCase() === 'true';
 const DB_FILE           = process.env.DB_FILE   || path.join(__dirname, 'violations.db');
 const REQUIRE_AUTH      = String(process.env.REQUIRE_AUTH || 'false').toLowerCase() === 'true';
 const DEVICE_API_KEY    = process.env.DEVICE_API_KEY || '';
@@ -57,7 +64,9 @@ const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID || '';
 const RETENTION_DAYS    = Math.max(1, parseInt(process.env.RETENTION_DAYS || '90', 10) || 90);
 const ONLINE_WINDOW_S   = 120;
 const STARTED           = Date.now();
-const VERSION           = '3.0';
+const VERSION           = '3.1';
+const SESS_COOKIE       = 'velocis_sess';
+const SESS_MAX_AGE_S    = 7 * 24 * 60 * 60;
 
 // ── Database ────────────────────────────────────────────────
 const db = new Database(DB_FILE);
@@ -291,7 +300,62 @@ function getApiKey(req) {
   return '';
 }
 
-function requireAdmin(req) {
+function parseCookies(req) {
+  const header = req.get('Cookie') || '';
+  const out = {};
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    const k = part.slice(0, i).trim();
+    if (!k) continue;
+    try {
+      out[k] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      out[k] = part.slice(i + 1).trim();
+    }
+  }
+  return out;
+}
+
+function signRole(role) {
+  return crypto.createHmac('sha256', ADMIN_KEY).update(String(role)).digest('hex');
+}
+
+function makeSessionToken(role) {
+  return role + ':' + signRole(role);
+}
+
+function verifySessionToken(token) {
+  if (!token || typeof token !== 'string') return null;
+  const i = token.indexOf(':');
+  if (i < 0) return null;
+  const role = token.slice(0, i);
+  const sig = token.slice(i + 1);
+  if (role !== 'admin' && role !== 'viewer') return null;
+  const expected = signRole(role);
+  try {
+    const a = Buffer.from(sig, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length) return null;
+    if (!crypto.timingSafeEqual(a, b)) return null;
+  } catch {
+    return null;
+  }
+  return role;
+}
+
+function sessionCookieHeader(token) {
+  return (
+    SESS_COOKIE + '=' + encodeURIComponent(token) +
+    '; HttpOnly; Path=/; SameSite=Lax; Max-Age=' + SESS_MAX_AGE_S
+  );
+}
+
+function clearSessionCookieHeader() {
+  return SESS_COOKIE + '=; HttpOnly; Path=/; SameSite=Lax; Max-Age=0';
+}
+
+function getProvidedAccessKey(req) {
   const q = req.query && req.query.key != null ? String(req.query.key) : '';
   const h =
     req.get('X-Admin-Key') ||
@@ -299,10 +363,39 @@ function requireAdmin(req) {
     req.get('X-API-Key') ||
     req.get('x-api-key') ||
     '';
-  const auth = req.get('Authorization') || '';
+  const auth = req.get('Authorization') || req.get('authorization') || '';
   const bearer = (auth.match(/^Bearer\s+(.+)$/i) || [])[1] || '';
-  const provided = q || h || bearer;
-  return provided === ADMIN_KEY;
+  return String(q || h || bearer || '').trim();
+}
+
+/** Resolve role from cookie or X-Admin-Key / Bearer / ?key= */
+function getSessionRole(req) {
+  const provided = getProvidedAccessKey(req);
+  if (provided && provided === ADMIN_KEY) return 'admin';
+  if (provided && provided === VIEWER_KEY) return 'viewer';
+
+  const cookies = parseCookies(req);
+  const fromCookie = verifySessionToken(cookies[SESS_COOKIE]);
+  if (fromCookie) return fromCookie;
+  return 'none';
+}
+
+function requireAdmin(req) {
+  return getSessionRole(req) === 'admin';
+}
+
+/** Admin or viewer when DASHBOARD_AUTH; otherwise open (compat). */
+function requireViewer(req) {
+  if (!DASHBOARD_AUTH) return true;
+  const role = getSessionRole(req);
+  return role === 'admin' || role === 'viewer';
+}
+
+function unauthorized(res, asHtml) {
+  if (asHtml) {
+    return res.status(401).type('html').send(getLoginHTML('Session required'));
+  }
+  return res.status(401).json({ ok: false, error: 'Unauthorized' });
 }
 
 function authorizeDevice(req, deviceId) {
@@ -464,8 +557,34 @@ app.get('/api/health', (req, res) => {
     uptime_s: Math.floor((Date.now() - STARTED) / 1000),
     db: dbOk ? 'ok' : 'error',
     require_auth: REQUIRE_AUTH,
+    dashboard_auth: DASHBOARD_AUTH,
     telegram: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID),
     retention_days: RETENTION_DAYS,
+  });
+});
+
+app.post('/api/login', (req, res) => {
+  const key = String((req.body && req.body.key) || '').trim();
+  let role = null;
+  if (key && key === ADMIN_KEY) role = 'admin';
+  else if (key && key === VIEWER_KEY) role = 'viewer';
+  else return res.status(401).json({ ok: false, error: 'Invalid key' });
+
+  res.setHeader('Set-Cookie', sessionCookieHeader(makeSessionToken(role)));
+  return res.json({ ok: true, role });
+});
+
+app.post('/api/logout', (req, res) => {
+  res.setHeader('Set-Cookie', clearSessionCookieHeader());
+  return res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  const role = getSessionRole(req);
+  return res.json({
+    ok: true,
+    role: role === 'admin' || role === 'viewer' ? role : 'none',
+    dashboard_auth: DASHBOARD_AUTH,
   });
 });
 
@@ -561,6 +680,8 @@ app.post('/api/heartbeat', (req, res) => {
 });
 
 app.get('/api/violations', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+
   const limit  = Math.min(parseInt(req.query.limit || '200', 10) || 200, 1000);
   const tier   = req.query.tier   ? String(req.query.tier).toUpperCase() : null;
   const device = req.query.device ? String(req.query.device) : null;
@@ -584,6 +705,8 @@ app.get('/api/violations', (req, res) => {
 });
 
 app.get('/api/violations.csv', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+
   const tier   = req.query.tier   ? String(req.query.tier).toUpperCase() : null;
   const device = req.query.device ? String(req.query.device) : null;
   const limit  = Math.min(parseInt(req.query.limit || '10000', 10) || 10000, 50000);
@@ -613,12 +736,16 @@ app.get('/api/violations.csv', (req, res) => {
 });
 
 app.get('/api/violations/:id', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+
   const row = stmtById.get(parseInt(req.params.id, 10));
   if (!row) return res.status(404).json({ ok: false, error: 'Not found' });
   return res.json({ ok: true, violation: row });
 });
 
 app.get('/api/stats', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+
   const stats   = stmtStats.get();
   const registry = stmtListDevices.all();
   const violAggs = stmtViolationDevices.all();
@@ -643,6 +770,8 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.get('/api/devices', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+
   const registry = stmtListDevices.all();
   const violAggs = stmtViolationDevices.all();
   const devices = enrichDevices(registry, violAggs);
@@ -847,8 +976,94 @@ app.post('/api/test-sms', (req, res) => {
 //  DASHBOARD
 // ══════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
+  if (DASHBOARD_AUTH && !requireViewer(req)) {
+    return res.type('html').send(getLoginHTML());
+  }
   res.type('html').send(getDashboardHTML());
 });
+
+function getLoginHTML(message) {
+  const err = message ? `<p class="err">${String(message).replace(/</g, '&lt;')}</p>` : '';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Velocis — Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#0b1f33;--muted:#6b7c8f;--line:#d5dee8;--teal:#0f9d8a;--card:#fff;--rose:#be123c}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:'Sora',sans-serif;min-height:100vh;display:grid;place-items:center;padding:24px;color:var(--ink);
+  background:
+    radial-gradient(900px 500px at 10% -10%, rgba(15,157,138,.16), transparent 55%),
+    linear-gradient(180deg,#e8eef4,#f0f4f8);
+}
+.card{
+  width:min(400px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:28px 24px;box-shadow:0 16px 40px rgba(11,31,51,.1);
+}
+.logo{
+  width:44px;height:44px;border-radius:12px;margin-bottom:14px;
+  background:linear-gradient(145deg,var(--ink),#163552);color:#9ef0e2;
+  display:grid;place-items:center;font-family:'IBM Plex Mono',monospace;font-weight:500;
+}
+h1{font-size:1.45rem;letter-spacing:-.02em;margin-bottom:6px}
+h1 span{color:var(--teal)}
+p{color:var(--muted);font-size:.9rem;line-height:1.45;margin-bottom:18px}
+.err{color:var(--rose);font-size:.85rem;margin-bottom:12px}
+label{display:block;font-size:.78rem;color:var(--muted);margin-bottom:6px}
+input{
+  width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;font:inherit;margin-bottom:14px;
+}
+button{
+  width:100%;border:0;border-radius:10px;padding:12px 14px;font:inherit;font-weight:600;cursor:pointer;
+  background:var(--teal);color:#fff;
+}
+button:hover{filter:brightness(.95)}
+.msg{min-height:1.2em;font-size:.85rem;color:var(--rose);margin-top:10px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">VX</div>
+    <h1>Veloc<span>is</span></h1>
+    <p>Enter an admin or viewer key to open the dashboard.</p>
+    ${err}
+    <form id="loginForm">
+      <label for="key">Access key</label>
+      <input id="key" name="key" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit">Sign in</button>
+      <div class="msg" id="msg"></div>
+    </form>
+  </div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg');
+  msg.textContent = '';
+  const key = document.getElementById('key').value.trim();
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key })
+    });
+    const d = await r.json();
+    if (d.ok) { location.href = '/'; return; }
+    msg.textContent = d.error || 'Invalid key';
+  } catch {
+    msg.textContent = 'Network error';
+  }
+});
+</script>
+</body>
+</html>`;
+}
 
 function getDashboardHTML() {
   return `<!DOCTYPE html>
@@ -1126,11 +1341,13 @@ tr:hover td{background:#f8fbfa}
       </div>
     </div>
     <div class="brand-meta">
-      <div class="ver">v3.0</div>
+      <div class="ver">v3.1</div>
+      <div class="pill" id="rolePill" style="display:none"></div>
       <div class="pill live" id="livePill"><span class="dot" id="liveDot"></span><span id="liveLabel">Connecting…</span></div>
       <div class="pill mono" id="clockPill">--:--:--</div>
       <a class="btn btn-ghost" href="/api/violations.csv">Export CSV</a>
-      <button class="btn btn-ghost" type="button" onclick="openAdmin()">Admin</button>
+      <button class="btn btn-ghost" type="button" id="adminBtn" onclick="openAdmin()">Admin</button>
+      <button class="btn btn-ghost" type="button" id="logoutBtn" style="display:none" onclick="logout()">Logout</button>
       <button class="btn btn-primary" type="button" onclick="loadAll(true)">Refresh</button>
     </div>
   </header>
@@ -1166,13 +1383,13 @@ tr:hover td{background:#f8fbfa}
         <span class="rel" id="regCount"></span>
       </div>
       <div class="reg-list" id="regList"><div class="empty">No devices yet</div></div>
-      <div class="form-grid">
+      <div class="form-grid" data-admin-only>
         <input class="field" id="devId" placeholder="Device ID *" >
         <input class="field" id="devLabel" placeholder="Label">
         <input class="field" id="devVehicle" placeholder="Vehicle">
         <input class="field" id="devKey" placeholder="API key (auto if blank)">
       </div>
-      <div class="form-actions">
+      <div class="form-actions" data-admin-only>
         <button class="btn btn-primary btn-sm" type="button" onclick="addDevice()">Add device</button>
       </div>
     </div>
@@ -1188,7 +1405,7 @@ tr:hover td{background:#f8fbfa}
       <span class="rel" id="geoCount"></span>
     </div>
     <div class="geo-list" id="geoList"><div class="empty">Loading…</div></div>
-    <div class="form-grid">
+    <div class="form-grid" data-admin-only>
       <input class="field full" id="geoName" placeholder="Name *">
       <input class="field" id="geoLatMin" placeholder="lat_min" type="number" step="any">
       <input class="field" id="geoLatMax" placeholder="lat_max" type="number" step="any">
@@ -1196,7 +1413,7 @@ tr:hover td{background:#f8fbfa}
       <input class="field" id="geoLonMax" placeholder="lon_max" type="number" step="any">
       <input class="field" id="geoLimit" placeholder="limit_kph *" type="number" step="any">
     </div>
-    <div class="form-actions">
+    <div class="form-actions" data-admin-only>
       <button class="btn btn-primary btn-sm" type="button" onclick="addGeofence()">Add geofence</button>
       <button class="btn btn-ghost btn-sm" type="button" onclick="runRetention()">Run retention purge</button>
     </div>
@@ -1216,7 +1433,7 @@ tr:hover td{background:#f8fbfa}
           <option value="MINOR">Minor</option>
         </select>
         <input class="field" id="filterDevice" placeholder="Filter device ID" oninput="debouncedLoad()">
-        <button class="btn btn-ghost" type="button" onclick="clearAll()">Clear all</button>
+        <button class="btn btn-ghost" type="button" data-admin-only onclick="clearAll()">Clear all</button>
         <a class="btn btn-ghost" id="csvLink" href="/api/violations.csv">CSV</a>
       </div>
       <div class="table-wrap">
@@ -1268,7 +1485,7 @@ tr:hover td{background:#f8fbfa}
       <a href="/api/geofences">/api/geofences</a> ·
       <a href="/api/violations.csv">CSV</a>
     </div>
-    <div>Velocis server v3.0 · port ${PORT}</div>
+    <div>Velocis server v3.1 · port ${PORT}</div>
   </footer>
 </div>
 
@@ -1289,6 +1506,8 @@ tr:hover td{background:#f8fbfa}
 <script>
 const REFRESH_MS = 5000;
 let adminKey = localStorage.getItem('velocis_admin') || '';
+let sessionRole = 'none';
+let dashboardAuth = false;
 let loadTimer = null;
 let debounceTimer = null;
 let lastLatestId = null;
@@ -1303,6 +1522,66 @@ function toast(msg, ok=true){
   setTimeout(() => el.remove(), 3200);
 }
 
+function isAdminRole(){
+  if (sessionRole === 'admin') return true;
+  if (sessionRole === 'viewer') return false;
+  return !!adminKey;
+}
+
+function applyRoleUI(){
+  const isAdmin = sessionRole === 'admin';
+  const isViewer = sessionRole === 'viewer';
+  const loggedIn = isAdmin || isViewer;
+  // Hide write controls only for viewer sessions; open mode keeps forms visible
+  const showAdminUI = !isViewer;
+
+  const rolePill = document.getElementById('rolePill');
+  if (rolePill) {
+    if (isAdmin) {
+      rolePill.style.display = '';
+      rolePill.textContent = 'Admin';
+    } else if (isViewer) {
+      rolePill.style.display = '';
+      rolePill.textContent = 'Viewer';
+    } else {
+      rolePill.style.display = 'none';
+    }
+  }
+
+  const logoutBtn = document.getElementById('logoutBtn');
+  if (logoutBtn) logoutBtn.style.display = loggedIn ? '' : 'none';
+
+  document.querySelectorAll('[data-admin-only]').forEach(el => {
+    el.style.display = showAdminUI ? '' : 'none';
+  });
+}
+
+async function initAuth(){
+  try {
+    const r = await fetch('/api/me', { credentials: 'same-origin' });
+    const d = await r.json();
+    sessionRole = (d && d.role) || 'none';
+    dashboardAuth = !!(d && d.dashboard_auth);
+  } catch {
+    sessionRole = 'none';
+  }
+  applyRoleUI();
+  if (dashboardAuth && sessionRole === 'none') {
+    location.href = '/';
+    return false;
+  }
+  return true;
+}
+
+async function logout(){
+  try {
+    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+  } catch {}
+  sessionRole = 'none';
+  applyRoleUI();
+  location.href = '/';
+}
+
 function openAdmin(){
   document.getElementById('adminKeyInput').value = adminKey;
   document.getElementById('adminModal').classList.add('open');
@@ -1313,7 +1592,9 @@ function saveAdmin(){
   adminKey = document.getElementById('adminKeyInput').value.trim();
   localStorage.setItem('velocis_admin', adminKey);
   closeAdmin();
+  applyRoleUI();
   toast(adminKey ? 'Admin key saved' : 'Admin key cleared');
+  loadGeofences();
 }
 
 function adminHeaders(json){
@@ -1321,6 +1602,10 @@ function adminHeaders(json){
   if (json) h['Content-Type'] = 'application/json';
   if (adminKey) h['X-Admin-Key'] = adminKey;
   return h;
+}
+
+function adminQuery(){
+  return adminKey ? ('?key=' + encodeURIComponent(adminKey)) : '';
 }
 
 function setLive(ok, label){
@@ -1514,20 +1799,22 @@ function renderRegistry(devices){
   list.innerHTML = devices.map(d => {
     const id = d.id || d.device;
     const label = d.label || id;
+    const delBtn = isAdminRole()
+      ? '<button class="btn btn-ghost btn-sm" type="button" data-id="' + esc(id) +
+        '" onclick="deleteDevice(this.getAttribute(&quot;data-id&quot;))">Del</button>'
+      : '';
     return '<div class="reg-item"><div>' +
       '<span class="status-dot ' + (d.online ? 'on' : 'off') + '"></span>' +
       '<strong>' + esc(label) + '</strong>' +
       (d.vehicle ? ' <span class="rel">· ' + esc(d.vehicle) + '</span>' : '') +
       '<div class="sub mono">' + esc(id) + '</div>' +
       '<div class="sub">' + (d.last_speed != null ? d.last_speed + ' km/h · ' : '') +
-      relTime(d.last_seen) + '</div></div>' +
-      '<button class="btn btn-ghost btn-sm" type="button" data-id="' + esc(id) +
-      '" onclick="deleteDevice(this.getAttribute(&quot;data-id&quot;))">Del</button></div>';
+      relTime(d.last_seen) + '</div></div>' + delBtn + '</div>';
   }).join('');
 }
 
 async function loadStats(){
-  const r = await fetch('/api/stats');
+  const r = await fetch('/api/stats', { credentials: 'same-origin' });
   const d = await r.json();
   if (!d.ok) throw new Error('stats failed');
   const s = d.stats;
@@ -1566,10 +1853,10 @@ async function loadStats(){
 }
 
 async function loadGeofences(){
-  const url = adminKey
-    ? '/api/geofences?all=1&key=' + encodeURIComponent(adminKey)
+  const url = isAdminRole()
+    ? '/api/geofences?all=1' + (adminKey ? '&key=' + encodeURIComponent(adminKey) : '')
     : '/api/geofences';
-  const r = await fetch(url);
+  const r = await fetch(url, { credentials: 'same-origin', headers: adminHeaders(false) });
   const d = await r.json();
   if (!d.ok) throw new Error('geofences failed');
   const rows = d.geofences || [];
@@ -1584,7 +1871,10 @@ async function loadGeofences(){
     (g.active ? '' : ' <span class="rel">(inactive)</span>') +
     '<div class="sub mono">' + g.lat_min + '–' + g.lat_max + ' / ' +
     g.lon_min + '–' + g.lon_max + ' · ' + g.limit_kph + ' km/h</div></div>' +
-    '<button class="btn btn-ghost btn-sm" type="button" onclick="deleteGeofence(' + g.id + ')">Del</button></div>'
+    (isAdminRole()
+      ? '<button class="btn btn-ghost btn-sm" type="button" onclick="deleteGeofence(' + g.id + ')">Del</button>'
+      : '') +
+    '</div>'
   ).join('');
 }
 
@@ -1597,7 +1887,7 @@ async function loadViolations(){
   if (device) { url += '&device=' + encodeURIComponent(device); csv += 'device=' + encodeURIComponent(device) + '&'; }
   document.getElementById('csvLink').href = csv.replace(/[&?]$/, '');
 
-  const r = await fetch(url);
+  const r = await fetch(url, { credentials: 'same-origin' });
   const d = await r.json();
   if (!d.ok) throw new Error('violations failed');
 
@@ -1627,8 +1917,8 @@ async function loadViolations(){
 async function loadAll(manual){
   try {
     await Promise.all([loadStats(), loadViolations(), loadGeofences()]);
-    const h = await fetch('/api/health').then(r => r.json());
-    setLive(!!h.ok, h.ok ? 'Live · v' + (h.version || '3.0') + ' · ' + h.uptime_s + 's' : 'Degraded');
+    const h = await fetch('/api/health', { credentials: 'same-origin' }).then(r => r.json());
+    setLive(!!h.ok, h.ok ? 'Live · v' + (h.version || '3.1') + ' · ' + h.uptime_s + 's' : 'Degraded');
     if (manual) toast('Dashboard refreshed');
   } catch (e) {
     console.error(e);
@@ -1643,10 +1933,14 @@ function debouncedLoad(){
 }
 
 async function clearAll(){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   if (!confirm('Delete ALL violation records? This cannot be undone.')) return;
   try {
-    const r = await fetch('/api/violations?key=' + encodeURIComponent(adminKey), { method: 'DELETE' });
+    const r = await fetch('/api/violations' + adminQuery(), {
+      method: 'DELETE',
+      credentials: 'same-origin',
+      headers: adminHeaders(false)
+    });
     const d = await r.json();
     if (d.ok) { toast('Log cleared'); loadAll(); }
     else toast(d.error || 'Denied', false);
@@ -1654,7 +1948,7 @@ async function clearAll(){
 }
 
 async function addDevice(){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   const id = document.getElementById('devId').value.trim();
   if (!id) { toast('Device ID required', false); return; }
   const body = {
@@ -1664,8 +1958,9 @@ async function addDevice(){
     api_key: document.getElementById('devKey').value.trim() || undefined
   };
   try {
-    const r = await fetch('/api/devices?key=' + encodeURIComponent(adminKey), {
+    const r = await fetch('/api/devices' + adminQuery(), {
       method: 'POST',
+      credentials: 'same-origin',
       headers: adminHeaders(true),
       body: JSON.stringify(body)
     });
@@ -1682,11 +1977,12 @@ async function addDevice(){
 }
 
 async function deleteDevice(id){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   if (!confirm('Delete device ' + id + '?')) return;
   try {
-    const r = await fetch('/api/devices/' + encodeURIComponent(id) + '?key=' + encodeURIComponent(adminKey), {
+    const r = await fetch('/api/devices/' + encodeURIComponent(id) + adminQuery(), {
       method: 'DELETE',
+      credentials: 'same-origin',
       headers: adminHeaders(false)
     });
     const d = await r.json();
@@ -1696,7 +1992,7 @@ async function deleteDevice(id){
 }
 
 async function addGeofence(){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   const body = {
     name: document.getElementById('geoName').value.trim(),
     lat_min: parseFloat(document.getElementById('geoLatMin').value),
@@ -1709,8 +2005,9 @@ async function addGeofence(){
     toast('Name and limit required', false); return;
   }
   try {
-    const r = await fetch('/api/geofences?key=' + encodeURIComponent(adminKey), {
+    const r = await fetch('/api/geofences' + adminQuery(), {
       method: 'POST',
+      credentials: 'same-origin',
       headers: adminHeaders(true),
       body: JSON.stringify(body)
     });
@@ -1726,11 +2023,12 @@ async function addGeofence(){
 }
 
 async function deleteGeofence(id){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   if (!confirm('Delete geofence #' + id + '?')) return;
   try {
-    const r = await fetch('/api/geofences/' + id + '?key=' + encodeURIComponent(adminKey), {
+    const r = await fetch('/api/geofences/' + id + adminQuery(), {
       method: 'DELETE',
+      credentials: 'same-origin',
       headers: adminHeaders(false)
     });
     const d = await r.json();
@@ -1740,11 +2038,12 @@ async function deleteGeofence(id){
 }
 
 async function runRetention(){
-  if (!adminKey) { openAdmin(); toast('Set admin key first', false); return; }
+  if (!isAdminRole()) { openAdmin(); toast('Admin access required', false); return; }
   if (!confirm('Purge violations older than retention window?')) return;
   try {
-    const r = await fetch('/api/retention?key=' + encodeURIComponent(adminKey), {
+    const r = await fetch('/api/retention' + adminQuery(), {
       method: 'POST',
+      credentials: 'same-origin',
       headers: adminHeaders(true),
       body: '{}'
     });
@@ -1761,6 +2060,7 @@ async function sendBackendSMS(){
   try {
     const res = await fetch('/api/test-sms', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phone, message: msg })
     });
@@ -1772,11 +2072,15 @@ async function sendBackendSMS(){
   } catch { toast('Network error', false); }
 }
 
-tickClock();
-setInterval(tickClock, 1000);
-ensureMap();
-loadAll();
-loadTimer = setInterval(() => loadAll(false), REFRESH_MS);
+(async function boot(){
+  tickClock();
+  setInterval(tickClock, 1000);
+  const ok = await initAuth();
+  if (!ok) return;
+  ensureMap();
+  loadAll();
+  loadTimer = setInterval(() => loadAll(false), REFRESH_MS);
+})();
 </script>
 </body>
 </html>`;
@@ -1788,13 +2092,14 @@ app.use((req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════════╗`);
-  console.log(`║  Velocis Speed Monitor Server  v3.0      ║`);
+  console.log(`║  Velocis Speed Monitor Server  v3.1      ║`);
   console.log(`╠══════════════════════════════════════════╣`);
   console.log(`║  Dashboard : http://localhost:${String(PORT).padEnd(5)}      ║`);
   console.log(`║  Health    : GET  /api/health            ║`);
   console.log(`║  Ingest    : POST /api/violation         ║`);
   console.log(`║  Heartbeat : POST /api/heartbeat         ║`);
   console.log(`║  Auth      : ${String(REQUIRE_AUTH ? 'REQUIRED' : 'optional').padEnd(28)} ║`);
+  console.log(`║  Dash auth : ${String(DASHBOARD_AUTH ? 'ON' : 'off').padEnd(28)} ║`);
   console.log(`║  DB File   : ${String(DB_FILE).slice(-28).padEnd(28)} ║`);
   console.log(`╚══════════════════════════════════════════╝\n`);
 });
