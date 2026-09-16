@@ -1,7 +1,7 @@
 {
   "name": "gps-speed-monitor-server",
-  "version": "1.0.0",
-  "description": "Mini server for GPS Speed Limit Alert & Monitoring System",
+  "version": "2.0.0",
+  "description": "Velocis — GPS speed monitor ingest API & live violation desk",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
