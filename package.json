@@ -1,7 +1,7 @@
 {
   "name": "gps-speed-monitor-server",
-  "version": "2.0.0",
-  "description": "Velocis — GPS speed monitor ingest API & live violation desk",
+  "version": "3.0.0",
+  "description": "Velocis Server v3.0 — GPS speed monitor ingest API, device registry, geofences & live dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
