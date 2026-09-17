@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Velocis — Sign In</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/style.css">
+  <style>
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .login-card {
+      width: min(420px, 100%);
+      padding: 32px 28px;
+    }
+    .login-brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .login-err {
+      color: var(--accent-rose);
+      font-size: 0.85rem;
+      margin-top: 12px;
+      min-height: 1.2em;
+    }
+  </style>
+</head>
+<body>
+  <div class="glass-panel login-card">
+    <div class="login-brand">
+      <div class="brand-icon">VX</div>
+      <div>
+        <h1 class="brand-title">Veloc<span>is</span></h1>
+        <div class="brand-subtitle">Speed Telemetry Console</div>
+      </div>
+    </div>
+
+    <p style="font-size:0.9rem;color:var(--text-muted);margin-bottom:20px;line-height:1.45">
+      Please authenticate with your fleet admin or operator viewer key to access the command desk.
+    </p>
+
+    <form id="loginForm">
+      <div style="margin-bottom:16px">
+        <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:6px">Access Key</label>
+        <input class="input-field" id="key" name="key" type="password" autocomplete="current-password" placeholder="Enter key" required autofocus style="width:100%">
+      </div>
+      <button class="btn btn-primary" type="submit" style="width:100%;padding:12px">Sign In to Console</button>
+      <div class="login-err" id="msg"></div>
+    </form>
+  </div>
+
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const msg = document.getElementById('msg');
+      msg.textContent = '';
+      const key = document.getElementById('key').value.trim();
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ key })
+        });
+        const d = await r.json();
+        if (d.ok) { location.href = '/'; return; }
+        msg.textContent = d.error || 'Invalid credentials';
+      } catch {
+        msg.textContent = 'Network communication error';
+      }
+    });
+  </script>
+</body>
+</html>

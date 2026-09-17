@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Velocis — Fleet Telemetry & Speed Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="telemetry-header">
+      <div class="brand-section">
+        <div class="brand-icon">VX</div>
+        <div>
+          <h1 class="brand-title">Veloc<span>is</span></h1>
+          <div class="brand-subtitle">Fleet Telemetry &amp; Road Safety Monitor</div>
+        </div>
+      </div>
+
+      <div class="header-status-group">
+        <span class="version-tag">v3.2 PRO</span>
+        <div class="telemetry-pill" id="livePill">
+          <span class="pulse-dot live" id="liveDot"></span>
+          <span id="liveLabel">Connecting…</span>
+        </div>
+        <div class="telemetry-pill mono-cell" id="clockPill">--:--:--</div>
+        <div class="telemetry-pill" id="rolePill" style="display:none"></div>
+
+        <button class="telemetry-pill interactive" id="soundToggleBtn" onclick="toggleSound()" title="Toggle Web Audio alerts">
+          🔔 Chimes ON
+        </button>
+        <button class="telemetry-pill interactive" id="themeToggleBtn" onclick="toggleTheme()" title="Toggle Dark/Light Mode">
+          ☀️ Light
+        </button>
+
+        <button class="btn btn-ghost" type="button" id="adminBtn" onclick="openAdmin()">Admin</button>
+        <button class="btn btn-ghost" type="button" id="logoutBtn" style="display:none" onclick="logout()">Logout</button>
+        <button class="btn btn-primary" type="button" onclick="loadAll(true)">Refresh</button>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs" role="tablist">
+      <button class="tab-btn active" data-tab="cockpit" onclick="switchTab('cockpit')">
+        🧭 Live Cockpit
+      </button>
+      <button class="tab-btn" data-tab="ledger" onclick="switchTab('ledger')">
+        📋 Violation Ledger <span class="tab-badge" id="violationCountLabel">0</span>
+      </button>
+      <button class="tab-btn" data-tab="devices" onclick="switchTab('devices')">
+        🚗 Fleet &amp; Units
+      </button>
+      <button class="tab-btn" data-tab="geofences" onclick="switchTab('geofences')">
+        🗺️ Geofence Zones
+      </button>
+      <button class="tab-btn" data-tab="simulator" onclick="switchTab('simulator')">
+        ⚡ Simulator &amp; Testing
+      </button>
+    </nav>
+
+    <!-- TAB 1: COCKPIT OVERVIEW -->
+    <div class="tab-content-panel" id="tab-cockpit">
+      <!-- Hero Status & Speedometer Gauge -->
+      <section class="hero-telemetry-grid">
+        <div class="glass-panel hero-status-card">
+          <div>
+            <div class="hero-eyebrow">
+              <span class="pulse-dot live"></span> Fleet Mission Status
+            </div>
+            <div class="hero-title ok" id="heroTitle">All Systems Nominal</div>
+            <p class="hero-description" id="heroSub">
+              Connected to active ESP32 trackers. Speed violation telemetry streams in real time.
+            </p>
+          </div>
+          <div class="hero-chips" id="heroChips">
+            <span class="telemetry-chip">🟢 Loading…</span>
+          </div>
+        </div>
+
+        <div class="glass-panel cockpit-gauge-card">
+          <div class="hero-eyebrow">Peak Live Speed Dial</div>
+          <div class="gauge-wrap">
+            <svg class="gauge-svg" viewBox="0 0 200 120">
+              <path class="gauge-bg-arc" d="M 20 105 A 80 80 0 0 1 180 105"></path>
+              <path class="gauge-val-arc" id="gaugeValArc" d="M 20 105 A 80 80 0 0 1 180 105"></path>
+            </svg>
+            <div class="gauge-center-readout">
+              <div class="gauge-speed-val" id="gaugeSpeedVal">0</div>
+              <div class="gauge-speed-unit">KM / H</div>
+            </div>
+          </div>
+          <div class="gauge-meta-bar">
+            <span>Status: <strong id="gaugeDeltaVal">Compliant</strong></span>
+            <span>Scale: <strong>0 - 160 km/h</strong></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- KPI Matrix -->
+      <section class="kpi-grid">
+        <div class="glass-panel kpi-card cyan">
+          <div class="kpi-label">Today's Events</div>
+          <div class="kpi-value" id="sToday">—</div>
+          <div class="kpi-hint">violations recorded</div>
+        </div>
+        <div class="glass-panel kpi-card">
+          <div class="kpi-label">All-Time Total</div>
+          <div class="kpi-value" id="sTotal">—</div>
+          <div class="kpi-hint">cumulative ledger</div>
+        </div>
+        <div class="glass-panel kpi-card severe">
+          <div class="kpi-label">Severe Tier</div>
+          <div class="kpi-value" id="sSevere">—</div>
+          <div class="kpi-hint">SMS dispatched</div>
+        </div>
+        <div class="glass-panel kpi-card moderate">
+          <div class="kpi-label">Moderate Tier</div>
+          <div class="kpi-value" id="sModerate">—</div>
+          <div class="kpi-hint">&gt;10 km/h excess</div>
+        </div>
+        <div class="glass-panel kpi-card minor">
+          <div class="kpi-label">Minor Tier</div>
+          <div class="kpi-value" id="sMinor">—</div>
+          <div class="kpi-hint">&gt;1 km/h excess</div>
+        </div>
+        <div class="glass-panel kpi-card">
+          <div class="kpi-label">Peak Speed</div>
+          <div class="kpi-value" id="sMaxSpeed">—</div>
+          <div class="kpi-hint"><span id="sOnlineUnits">0</span> units online</div>
+        </div>
+      </section>
+
+      <!-- Map & Analytics -->
+      <section class="cockpit-main-layout">
+        <div class="glass-panel">
+          <div class="panel-header">
+            <h2>🗺️ Live Fleet Positioning &amp; Geofences</h2>
+            <div style="display:flex;gap:8px">
+              <span class="telemetry-pill">Click map to prefill zone</span>
+            </div>
+          </div>
+          <div class="map-container-wrap">
+            <div id="map"></div>
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:16px">
+          <!-- 24-Hour Sparkline Card -->
+          <div class="glass-panel">
+            <div class="panel-header">
+              <h3>📈 24-Hour Violation Trend</h3>
+              <div class="mono-cell" style="font-size:0.75rem;color:var(--text-muted)">
+                <span id="hEvents">0</span> events · <span id="hSevere" style="color:var(--accent-rose)">0</span> severe
+              </div>
+            </div>
+            <div class="panel-body" style="padding:14px">
+              <div id="spark" style="height:70px;width:100%"></div>
+            </div>
+          </div>
+
+          <!-- Severity Mix Card -->
+          <div class="glass-panel">
+            <div class="panel-header">
+              <h3>⚖️ Severity Distribution</h3>
+            </div>
+            <div class="severity-bars-container" id="severityBars"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- TAB 2: VIOLATION LEDGER -->
+    <div class="tab-content-panel" id="tab-ledger" style="display:none">
+      <div class="glass-panel">
+        <div class="panel-header">
+          <h2>📋 Historical Violation Ledger</h2>
+          <div style="display:flex;gap:8px">
+            <a class="btn btn-ghost" id="csvExportBtn" href="/api/violations.csv">Export CSV</a>
+            <button class="btn btn-danger btn-sm" type="button" data-admin-only onclick="clearAllViolations()">Clear Records</button>
+          </div>
+        </div>
+
+        <div class="table-toolbar">
+          <div class="toolbar-filter-group">
+            <label style="font-size:0.75rem;color:var(--text-muted)">Filter Tier:</label>
+            <select class="select-field" id="filterTier" onchange="loadViolations()">
+              <option value="">All Tiers</option>
+              <option value="SEVERE">Severe (SMS)</option>
+              <option value="MODERATE">Moderate (+10)</option>
+              <option value="MINOR">Minor (+1)</option>
+            </select>
+
+            <input class="input-field" id="filterDevice" placeholder="Search Device ID..." oninput="debouncedLoadViolations()">
+          </div>
+          <div class="mono-cell" style="font-size:0.75rem;color:var(--text-muted)">
+            Real-time feed
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="telemetry-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Device</th>
+                <th>Tier</th>
+                <th>Speed</th>
+                <th>Limit</th>
+                <th>Excess</th>
+                <th>GPS Location</th>
+                <th>Recorded When</th>
+              </tr>
+            </thead>
+            <tbody id="violationsTbody">
+              <tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text-muted)">Loading violation feed…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: FLEET & DEVICES -->
+    <div class="tab-content-panel" id="tab-devices" style="display:none">
+      <div class="glass-panel" style="margin-bottom:20px">
+        <div class="panel-header">
+          <h2>🚗 Registered Fleet Units</h2>
+          <span class="telemetry-pill">Telemetry Presence</span>
+        </div>
+        <div class="device-cards-grid" id="deviceCardsGrid">
+          <div class="empty">Loading devices…</div>
+        </div>
+      </div>
+
+      <!-- Add Device Card (Admin Only) -->
+      <div class="glass-panel" data-admin-only>
+        <div class="panel-header">
+          <h3>➕ Register New Tracker Unit</h3>
+        </div>
+        <div class="panel-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:12px;margin-bottom:16px">
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Device ID *</label>
+              <input class="input-field" id="devId" placeholder="e.g. ESP32-DEV-01" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Unit Label</label>
+              <input class="input-field" id="devLabel" placeholder="e.g. Patrol Vehicle 4" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Vehicle Model</label>
+              <input class="input-field" id="devVehicle" placeholder="e.g. Toyota Hilux" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">API Key (Optional)</label>
+              <input class="input-field" id="devKey" placeholder="Auto-generated if empty" style="width:100%">
+            </div>
+          </div>
+          <button class="btn btn-primary" type="button" onclick="addDevice()">Register Unit</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: GEOFENCES -->
+    <div class="tab-content-panel" id="tab-geofences" style="display:none">
+      <div class="glass-panel" style="margin-bottom:20px">
+        <div class="panel-header">
+          <h2>🗺️ Active Road Geofences &amp; Speed Zones</h2>
+        </div>
+        <div id="geofenceListContainer">
+          <div style="padding:20px;color:var(--text-muted)">Loading geofences…</div>
+        </div>
+      </div>
+
+      <div class="glass-panel" data-admin-only>
+        <div class="panel-header">
+          <h3>➕ Create Dynamic Geofence Zone</h3>
+          <span style="font-size:0.75rem;color:var(--text-muted)">Tip: Click on map in Cockpit tab to prefill coordinates</span>
+        </div>
+        <div class="panel-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:12px;margin-bottom:16px">
+            <div style="grid-column:1/-1">
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Zone Name *</label>
+              <input class="input-field" id="geoName" placeholder="e.g. School Zone / Expressway Corridor" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Lat Min (South)</label>
+              <input class="input-field" id="geoLatMin" type="number" step="any" placeholder="9.0500" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Lat Max (North)</label>
+              <input class="input-field" id="geoLatMax" type="number" step="any" placeholder="9.0900" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Lon Min (West)</label>
+              <input class="input-field" id="geoLonMin" type="number" step="any" placeholder="7.4500" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Lon Max (East)</label>
+              <input class="input-field" id="geoLonMax" type="number" step="any" placeholder="7.5100" style="width:100%">
+            </div>
+            <div>
+              <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Speed Limit (km/h) *</label>
+              <input class="input-field" id="geoLimit" type="number" placeholder="40" style="width:100%">
+            </div>
+          </div>
+          <button class="btn btn-primary" type="button" onclick="addGeofence()">Save Geofence</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 5: SIMULATOR & TESTING -->
+    <div class="tab-content-panel" id="tab-simulator" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+        <!-- Telemetry Ingest Simulator -->
+        <div class="glass-panel">
+          <div class="panel-header">
+            <h3>⚡ Live Violation Simulator</h3>
+            <span class="telemetry-pill">Ingest Test Bench</span>
+          </div>
+          <div class="panel-body">
+            <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:14px">
+              Simulate an ESP32 sending a speed violation packet via HTTP POST. Great for testing dashboard animations, audio chimes, and map plots without driving!
+            </p>
+            <div style="display:flex;flex-direction:column;gap:12px">
+              <div>
+                <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Device ID</label>
+                <input class="input-field" id="simDevice" value="ESP32-DEV-01" style="width:100%">
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                <div>
+                  <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Reported Speed (km/h)</label>
+                  <input class="input-field" id="simSpeed" type="number" value="88" style="width:100%">
+                </div>
+                <div>
+                  <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Zone Limit (km/h)</label>
+                  <input class="input-field" id="simLimit" type="number" value="50" style="width:100%">
+                </div>
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                <div>
+                  <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Latitude</label>
+                  <input class="input-field" id="simLat" type="number" step="any" value="9.0722" style="width:100%">
+                </div>
+                <div>
+                  <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Longitude</label>
+                  <input class="input-field" id="simLon" type="number" step="any" value="7.4913" style="width:100%">
+                </div>
+              </div>
+              <button class="btn btn-primary" type="button" onclick="injectSimulatedViolation()" style="margin-top:8px">
+                🚀 Inject Violation Packet
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- SMS Backend Simulator -->
+        <div class="glass-panel">
+          <div class="panel-header">
+            <h3>📱 GSM SMS Gateway Tester</h3>
+            <span class="telemetry-pill">Server Console Log</span>
+          </div>
+          <div class="panel-body">
+            <p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:14px">
+              Test server-side SMS simulation endpoint. Logs the outgoing alert packet format.
+            </p>
+            <div style="display:flex;flex-direction:column;gap:12px">
+              <div>
+                <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Recipient Phone</label>
+                <input class="input-field" id="smsPhone" type="tel" placeholder="+2347059011222" style="width:100%">
+              </div>
+              <div>
+                <label style="display:block;font-size:0.75rem;color:var(--text-muted);margin-bottom:4px">Alert Message</label>
+                <textarea class="input-field" id="smsMsg" rows="3" placeholder="SPEED ALERT: Vehicle exceeded speed limit..." style="width:100%"></textarea>
+              </div>
+              <button class="btn btn-ghost" type="button" onclick="sendBackendSMS()" style="margin-top:8px">
+                📤 Dispatch Test SMS
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="telemetry-footer">
+      <div>
+        REST Ingest APIs: 
+        <a href="/api/health" target="_blank">/api/health</a> · 
+        <a href="/api/stats" target="_blank">/api/stats</a> · 
+        <a href="/api/devices" target="_blank">/api/devices</a> · 
+        <a href="/api/geofences" target="_blank">/api/geofences</a>
+      </div>
+      <div>Velocis Intelligent Speed Enforcement Console</div>
+    </footer>
+  </div>
+
+  <!-- Admin Modal -->
+  <div class="modal-backdrop" id="adminModal" onclick="if(event.target===this)closeAdmin()">
+    <div class="modal-dialog">
+      <div class="modal-title">🔐 Admin Console Authorization</div>
+      <p class="modal-desc">
+        Enter the system administrator access key to modify geofences, register fleet units, and clear audit records.
+      </p>
+      <input class="input-field" id="adminKeyInput" type="password" placeholder="Admin Key" style="width:100%">
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" onclick="closeAdmin()">Cancel</button>
+        <button class="btn btn-primary" type="button" onclick="saveAdmin()">Save Key</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toasts"></div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
