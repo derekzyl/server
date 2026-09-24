@@ -43,6 +43,7 @@
  *    TELEGRAM_BOT_TOKEN=
  *    TELEGRAM_CHAT_ID=
  *    RETENTION_DAYS=90
+ *    CARTO_API_KEY=
  * ============================================================
  */
 
@@ -66,6 +67,7 @@ const DEVICE_API_KEY    = process.env.DEVICE_API_KEY || '';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID || '';
 const RETENTION_DAYS    = Math.max(1, parseInt(process.env.RETENTION_DAYS || '90', 10) || 90);
+const CARTO_API_KEY     = process.env.CARTO_API_KEY || '';
 const ONLINE_WINDOW_S   = 120;
 const STARTED           = Date.now();
 const VERSION           = '3.2';
@@ -738,6 +740,7 @@ app.get('/api/me', (req, res) => {
     ok: true,
     role: role === 'admin' || role === 'viewer' ? role : 'none',
     dashboard_auth: DASHBOARD_AUTH,
+    carto_key: CARTO_API_KEY,
   });
 });
 

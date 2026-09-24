@@ -7,6 +7,7 @@ const REFRESH_INTERVAL_MS = 4000;
 let adminKey = localStorage.getItem('velocis_admin') || '';
 let sessionRole = 'none';
 let dashboardAuth = false;
+let cartoKey = '';
 let soundEnabled = localStorage.getItem('velocis_sound') !== 'false';
 let currentTheme = localStorage.getItem('velocis_theme') || 'dark';
 
@@ -211,6 +212,7 @@ async function initAuth() {
     const d = await r.json();
     sessionRole = (d && d.role) || 'none';
     dashboardAuth = !!(d && d.dashboard_auth);
+    cartoKey = (d && d.carto_key) || '';
   } catch {
     sessionRole = 'none';
   }
@@ -269,7 +271,8 @@ function initMap() {
   map = L.map('map', { zoomControl: true }).setView([9.07, 7.40], 11);
 
   // Modern CartoDB Dark Matter / Positron or OSM
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+  const keyParam = cartoKey ? `?key=${encodeURIComponent(cartoKey)}` : '';
+  L.tileLayer(`https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png${keyParam}`, {
     maxZoom: 19,
     attribution: '&copy; OpenStreetMap &copy; CARTO'
   }).addTo(map);
