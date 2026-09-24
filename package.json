@@ -1,7 +1,7 @@
 {
   "name": "gps-speed-monitor-server",
-  "version": "3.1.0",
-  "description": "Velocis Server v3.1 — GPS speed monitor ingest API, multi-tenant dashboard roles, device registry & geofences",
+  "version": "3.2.0",
+  "description": "Velocis Server v3.2 — GPS speed monitor ingest API, GPS track log, remote speed limits, multi-tenant dashboard roles, device registry & geofences",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

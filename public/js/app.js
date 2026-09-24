@@ -16,6 +16,9 @@ let lastLatestId = null;
 let map = null;
 let mapMarkers = {};
 let geofenceLayers = [];
+let trackLayer = null;
+let trackVisible = false;
+let trackFitPending = false;
 let audioCtx = null;
 
 // Telemetry State
@@ -146,6 +149,17 @@ function relTime(iso) {
   return Math.floor(s / 86400) + 'd ago';
 }
 
+function gmapsUrl(lat, lon) {
+  const a = parseFloat(lat), b = parseFloat(lon);
+  if (Number.isNaN(a) || Number.isNaN(b)) return null;
+  return `https://www.google.com/maps/search/?api=1&query=${a.toFixed(6)},${b.toFixed(6)}`;
+}
+
+function gmapsLink(lat, lon, text = 'Google Maps ↗', cls = 'btn btn-ghost btn-sm') {
+  const url = gmapsUrl(lat, lon);
+  return url ? `<a class="${cls}" href="${url}" target="_blank" rel="noopener">${text}</a>` : '';
+}
+
 function isAdminRole() {
   if (sessionRole === 'admin') return true;
   if (sessionRole === 'viewer') return false;
@@ -260,6 +274,9 @@ function initMap() {
     attribution: '&copy; OpenStreetMap &copy; CARTO'
   }).addTo(map);
 
+  // Stop the periodic auto-fit from yanking the view once the user moves the map.
+  map.on('dragstart', () => { map._userPanned = true; });
+
   // Allow clicking on map to prefill Geofence bounds
   map.on('click', (e) => {
     const lat = e.latlng.lat.toFixed(4);
@@ -294,7 +311,7 @@ function updateMapVehicles(devices) {
 
     const id = d.id || d.device;
     const isOnline = !!d.online;
-    const isSpeeding = d.last_speed != null && d.last_speed > (d.speed_limit || 50);
+    const isSpeeding = !!d.over_limit;
 
     const iconHtml = `
       <div class="custom-vehicle-marker">
@@ -317,10 +334,14 @@ function updateMapVehicles(devices) {
         <strong style="font-size:1rem;color:var(--accent-cyan)">${esc(d.label || id)}</strong>
         ${d.vehicle ? `<div style="font-size:0.75rem;color:var(--text-muted)">${esc(d.vehicle)}</div>` : ''}
         <div style="margin-top:6px;font-family:var(--font-mono);font-size:0.85rem">
-          Speed: <strong>${d.last_speed != null ? d.last_speed + ' km/h' : 'Stationary'}</strong>
+          Speed: <strong style="color:${isSpeeding ? 'var(--accent-rose)' : 'inherit'}">${d.last_speed != null ? d.last_speed + ' km/h' : 'Stationary'}</strong>
+          ${d.last_limit != null ? ` / limit ${d.last_limit}` : ''}
         </div>
         <div style="font-size:0.72rem;color:var(--text-muted);margin-top:4px">
-          Seen: ${relTime(d.last_seen)} · [${lat.toFixed(4)}, ${lon.toFixed(4)}]
+          Seen: ${relTime(d.last_seen)} · [${lat.toFixed(5)}, ${lon.toFixed(5)}]
+        </div>
+        <div style="margin-top:6px">
+          <a href="${gmapsUrl(lat, lon)}" target="_blank" rel="noopener">Open in Google Maps ↗</a>
         </div>
       </div>
     `;
@@ -330,7 +351,7 @@ function updateMapVehicles(devices) {
   });
 
   // Fit bounds if vehicles exist
-  if (bounds.length > 0 && !map._userPanned) {
+  if (bounds.length > 0 && !map._userPanned && !trackVisible) {
     try {
       map.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
     } catch {}
@@ -375,11 +396,123 @@ function zoomToLocation(lat, lon, label) {
   if (!map) return;
   const a = parseFloat(lat), b = parseFloat(lon);
   if (Number.isNaN(a) || Number.isNaN(b)) return;
+  map._userPanned = true;
   map.setView([a, b], 15);
   L.popup()
     .setLatLng([a, b])
-    .setContent(`<strong>${esc(label || 'Target Location')}</strong><br>${a.toFixed(4)}, ${b.toFixed(4)}`)
+    .setContent(`<strong>${esc(label || 'Target Location')}</strong><br>${a.toFixed(5)}, ${b.toFixed(5)}<br>` +
+      `<a href="${gmapsUrl(a, b)}" target="_blank" rel="noopener">Open in Google Maps ↗</a>`)
     .openOn(map);
+}
+
+// ── GPS Track Log ───────────────────────────────────────────
+function populateTrackDevices(devices) {
+  const sel = document.getElementById('trackDevice');
+  if (!sel) return;
+  const current = sel.value;
+  const ids = (devices || []).map(d => d.id || d.device);
+  const existing = Array.from(sel.options).slice(1).map(o => o.value);
+  if (ids.join('|') !== existing.join('|')) {
+    sel.innerHTML = '<option value="">Select device…</option>' + (devices || []).map(d => {
+      const id = d.id || d.device;
+      return `<option value="${esc(id)}">${esc(d.label || id)}${d.track_points_24h ? ` (${d.track_points_24h})` : ''}</option>`;
+    }).join('');
+    sel.value = ids.includes(current) ? current : '';
+  }
+  if (!sel.value && ids.length) sel.value = ids[0];
+}
+
+function clearTrackLayer() {
+  if (trackLayer && map) map.removeLayer(trackLayer);
+  trackLayer = null;
+}
+
+function toggleTrack() {
+  trackVisible = !trackVisible;
+  const btn = document.getElementById('trackToggleBtn');
+  if (btn) btn.textContent = trackVisible ? 'Hide from map' : 'Show on map';
+  if (trackVisible) {
+    trackFitPending = true;
+    loadTrack();
+  } else {
+    clearTrackLayer();
+  }
+}
+
+async function loadTrack(refit = false) {
+  const device = (document.getElementById('trackDevice') || {}).value || '';
+  const hours = (document.getElementById('trackHours') || {}).value || '24';
+  const countEl = document.getElementById('trackCount');
+  const summaryEl = document.getElementById('trackSummary');
+  const gm = document.getElementById('trackGmaps');
+  const csv = document.getElementById('trackCsv');
+
+  if (!device) {
+    clearTrackLayer();
+    if (gm) gm.style.display = 'none';
+    if (csv) csv.style.display = 'none';
+    if (countEl) countEl.textContent = '—';
+    return;
+  }
+  if (refit) trackFitPending = true;
+
+  const qs = `device=${encodeURIComponent(device)}&hours=${encodeURIComponent(hours)}`;
+  let d;
+  try {
+    d = await fetch(`/api/track?${qs}`, { credentials: 'same-origin' }).then(r => r.json());
+  } catch {
+    return;
+  }
+  if (!d || !d.ok) return;
+
+  const pts = d.points || [];
+  if (countEl) countEl.textContent = `${pts.length} pts`;
+  if (csv) { csv.href = `/api/track.csv?${qs}`; csv.style.display = pts.length ? '' : 'none'; }
+  if (gm) {
+    gm.href = d.route_url || '#';
+    gm.style.display = d.route_url ? '' : 'none';
+  }
+  if (summaryEl) {
+    if (!pts.length) {
+      summaryEl.textContent = `No GPS points logged for ${device} in the last ${hours} h.`;
+    } else {
+      const last = pts[pts.length - 1];
+      const overCount = pts.filter(p => p.over).length;
+      const maxSpd = Math.max(...pts.map(p => p.speed || 0));
+      summaryEl.innerHTML =
+        `Last point ${relTime(last.recorded_at)} · peak ${Math.round(maxSpd)} km/h · ` +
+        `<span style="color:${overCount ? 'var(--accent-rose)' : 'inherit'}">${overCount} over limit</span> · ` +
+        gmapsLink(last.lat, last.lon, 'last position ↗', '');
+    }
+  }
+
+  if (!trackVisible || !map) return;
+  clearTrackLayer();
+  if (!pts.length) return;
+
+  const latlngs = pts.map(p => [p.lat, p.lon]);
+  const layers = [L.polyline(latlngs, { color: '#00e5ff', weight: 4, opacity: 0.85 })];
+
+  const pointPopup = (p, title) =>
+    `<strong>${title}</strong><br>${esc(p.recorded_at)}<br>` +
+    `${p.speed != null ? Math.round(p.speed) + ' km/h' : '—'}${p.speed_limit != null ? ' / limit ' + p.speed_limit : ''}<br>` +
+    `<a href="${p.gmaps_url}" target="_blank" rel="noopener">Open in Google Maps ↗</a>`;
+
+  pts.filter(p => p.over).slice(-300).forEach(p => {
+    layers.push(L.circleMarker([p.lat, p.lon], { radius: 4, color: '#ff3366', fillOpacity: 0.9, weight: 1 })
+      .bindPopup(pointPopup(p, '⚠️ Over limit')));
+  });
+  const first = pts[0], last = pts[pts.length - 1];
+  layers.push(L.circleMarker([first.lat, first.lon], { radius: 6, color: '#0f9d8a', fillOpacity: 1 })
+    .bindPopup(pointPopup(first, 'Start')));
+  layers.push(L.circleMarker([last.lat, last.lon], { radius: 7, color: '#f59e0b', fillOpacity: 1 })
+    .bindPopup(pointPopup(last, 'Latest')));
+
+  trackLayer = L.layerGroup(layers).addTo(map);
+  if (trackFitPending) {
+    trackFitPending = false;
+    try { map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40], maxZoom: 16 }); } catch {}
+  }
 }
 
 // ── Speedometer Cockpit Gauge ───────────────────────────────
@@ -522,7 +655,7 @@ function updateHero(latest, stats) {
     chips.innerHTML = `
       <span class="telemetry-chip ${isSevere ? 'rose' : 'amber'}">${latest.tier}</span>
       <span class="telemetry-chip">⏱️ ${relTime(latest.received_at)}</span>
-      ${latest.lat != null ? `<span class="telemetry-chip">📍 ${parseFloat(latest.lat).toFixed(4)}, ${parseFloat(latest.lon).toFixed(4)}</span>` : ''}
+      ${latest.lat != null ? `<a class="telemetry-chip" href="${gmapsUrl(latest.lat, latest.lon)}" target="_blank" rel="noopener" title="Open in Google Maps">📍 ${parseFloat(latest.lat).toFixed(4)}, ${parseFloat(latest.lon).toFixed(4)} ↗</a>` : ''}
       <span class="telemetry-chip">🟢 ${stats.online_count || 0} Units Online</span>
     `;
   }
@@ -542,6 +675,10 @@ function renderDeviceCards(devices) {
   const host = document.getElementById('deviceCardsGrid');
   if (!host) return;
 
+  // Don't wipe a limit the admin is typing on the 4 s refresh.
+  const active = document.activeElement;
+  if (active && host.contains(active) && /^(INPUT|SELECT)$/.test(active.tagName)) return;
+
   if (!devices || !devices.length) {
     host.innerHTML = `<div class="empty" style="grid-column:1/-1;text-align:center;padding:30px;color:var(--text-muted)">No fleet devices registered yet.</div>`;
     return;
@@ -550,6 +687,9 @@ function renderDeviceCards(devices) {
   host.innerHTML = devices.map(d => {
     const id = d.id || d.device;
     const isOnline = !!d.online;
+    const over = !!d.over_limit;
+    const mode = d.limit_mode || 'manual';
+    const limitSetting = d.limit_kph != null ? Math.round(d.limit_kph) : null;
     return `
       <div class="device-card">
         <div class="device-card-header">
@@ -565,7 +705,11 @@ function renderDeviceCards(devices) {
         <div class="device-card-metrics">
           <div>
             <div class="dev-metric-lbl">Speed</div>
-            <div class="dev-metric-val">${d.last_speed != null ? d.last_speed + ' <span style="font-size:0.7rem">km/h</span>' : '—'}</div>
+            <div class="dev-metric-val" style="color:${over ? 'var(--accent-rose)' : 'inherit'}">${d.last_speed != null ? d.last_speed + ' <span style="font-size:0.7rem">km/h</span>' : '—'}</div>
+          </div>
+          <div>
+            <div class="dev-metric-lbl">Limit now</div>
+            <div class="dev-metric-val">${d.last_limit != null ? Math.round(d.last_limit) + ' <span style="font-size:0.7rem">km/h</span>' : '—'}</div>
           </div>
           <div>
             <div class="dev-metric-lbl">Violations</div>
@@ -573,17 +717,68 @@ function renderDeviceCards(devices) {
               ${d.total_violations || 0}
             </div>
           </div>
+          <div>
+            <div class="dev-metric-lbl">Status</div>
+            <div class="dev-metric-val" style="font-size:0.85rem;color:${over ? 'var(--accent-rose)' : 'var(--accent-teal)'}">
+              ${d.last_speed == null || d.last_limit == null ? '—' : (over ? `OVER +${Math.round(d.last_speed - d.last_limit)}` : 'Within limit')}
+            </div>
+          </div>
         </div>
+        <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:8px">
+          Limit setting: <strong>${limitSetting != null ? limitSetting + ' km/h' : 'not reported yet'}</strong> · ${mode === 'auto' ? 'AUTO (zones)' : 'SET'}
+          ${d.limit_pending ? '<span class="tier-tag moderate" title="Waiting for the device\'s next heartbeat">pending sync</span>' : ''}
+        </div>
+        ${isAdminRole() ? `
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+          <input class="input-field" data-lim-kph type="number" min="5" max="250" step="1" value="${limitSetting != null ? limitSetting : ''}" placeholder="km/h" style="width:80px">
+          <select class="select-field" data-lim-mode>
+            <option value="manual" ${mode !== 'auto' ? 'selected' : ''}>Set (fixed)</option>
+            <option value="auto" ${mode === 'auto' ? 'selected' : ''}>Auto (zones)</option>
+          </select>
+          <button class="btn btn-primary btn-sm" data-dev="${esc(id)}" onclick="saveDeviceLimit(this)">Set limit</button>
+        </div>` : ''}
         <div style="display:flex;justify-content:space-between;align-items:center;font-size:0.75rem;color:var(--text-muted)">
           <span>Seen: ${relTime(d.last_seen)}</span>
-          <div style="display:flex;gap:6px">
+          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
             ${d.last_lat != null ? `<button class="btn btn-ghost btn-sm" onclick="zoomToLocation(${d.last_lat}, ${d.last_lon}, '${esc(id)}')">Locate</button>` : ''}
+            ${d.gmaps_url ? `<a class="btn btn-ghost btn-sm" href="${esc(d.gmaps_url)}" target="_blank" rel="noopener">Google Maps ↗</a>` : ''}
             ${isAdminRole() ? `<button class="btn btn-danger btn-sm" onclick="deleteDevice('${esc(id)}')">Remove</button>` : ''}
           </div>
         </div>
       </div>
     `;
   }).join('');
+}
+
+async function saveDeviceLimit(btn) {
+  if (!isAdminRole()) { openAdmin(); toast('Admin authorization required', false); return; }
+  const card = btn.closest('.device-card');
+  const id = btn.dataset.dev;
+  const kph = parseFloat(card.querySelector('[data-lim-kph]').value);
+  const mode = card.querySelector('[data-lim-mode]').value;
+  if (Number.isNaN(kph) || kph < 5 || kph > 250) { toast('Limit must be 5–250 km/h', false); return; }
+
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/devices/' + encodeURIComponent(id) + '/limit' + adminQuery(), {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: adminHeaders(true),
+      body: JSON.stringify({ limit_kph: kph, mode })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      toast(`${id}: limit ${Math.round(kph)} km/h queued, applies on the device's next heartbeat`);
+      btn.blur();
+      loadStats();
+    } else {
+      toast(d.error || 'Limit update rejected', false);
+    }
+  } catch {
+    toast('Network request failed', false);
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── Violation Ledger Feed ───────────────────────────────────
@@ -632,7 +827,10 @@ async function loadViolations() {
         <td class="mono-cell">${v.speed_limit}</td>
         <td class="mono-cell" style="color:${excessColor};font-weight:700">+${v.excess}</td>
         <td>
-          ${v.lat != null ? `<a class="btn btn-ghost btn-sm" href="javascript:void(0)" onclick="zoomToLocation(${v.lat}, ${v.lon}, '${esc(v.device)}')">📍 ${parseFloat(v.lat).toFixed(4)}, ${parseFloat(v.lon).toFixed(4)}</a>` : '—'}
+          ${v.lat != null ? `<div style="display:flex;gap:4px;flex-wrap:wrap">
+            <a class="btn btn-ghost btn-sm" href="javascript:void(0)" title="Show on dashboard map" onclick="zoomToLocation(${v.lat}, ${v.lon}, '${esc(v.device)}')">📍 ${parseFloat(v.lat).toFixed(4)}, ${parseFloat(v.lon).toFixed(4)}</a>
+            ${gmapsLink(v.lat, v.lon, 'Google Maps ↗')}
+          </div>` : '—'}
         </td>
         <td>
           <div style="font-weight:500">${relTime(v.received_at)}</div>
@@ -706,13 +904,15 @@ async function loadStats() {
   renderSeverityMix(s);
   renderDeviceCards(telemetryData.devices);
   updateMapVehicles(telemetryData.devices);
+  populateTrackDevices(telemetryData.devices);
 }
 
 async function loadAll(manual = false) {
   try {
     await Promise.all([loadStats(), loadViolations(), loadGeofences()]);
+    loadTrack();
     const h = await fetch('/api/health', { credentials: 'same-origin' }).then(r => r.json());
-    setLive(!!h.ok, h.ok ? `Live v${h.version || '3.1'}` : 'Degraded');
+    setLive(!!h.ok, h.ok ? `Live v${h.version || '3.2'}` : 'Degraded');
     if (manual) toast('Telemetry desk refreshed');
   } catch (e) {
     console.error(e);

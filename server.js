@@ -1,12 +1,15 @@
 /**
  * ============================================================
- *  Velocis Server  v3.1
+ *  Velocis Server  v3.2
  *  Node.js + Express + SQLite
  *
  *  Endpoints
  *  ---------
  *  POST   /api/violation              ← ESP32 posts alerts
- *  POST   /api/heartbeat              ← device presence / last_*
+ *  POST   /api/heartbeat              ← device presence / last_* (+ limit sync)
+ *  POST   /api/track                  ← GPS track points (batch)
+ *  GET    /api/track?device=&hours=   ← track + Google Maps route URL
+ *  GET    /api/track.csv              ← track CSV export
  *  GET    /api/violations             ← list (JSON)
  *  GET    /api/violations/:id         ← single
  *  GET    /api/violations.csv         ← CSV export
@@ -14,6 +17,7 @@
  *  GET    /api/devices                ← device registry (+ online)
  *  POST   /api/devices                ← admin register
  *  PATCH  /api/devices/:id            ← admin update
+ *  PATCH  /api/devices/:id/limit      ← admin set speed limit (pushed on next heartbeat)
  *  DELETE /api/devices/:id            ← admin delete
  *  GET    /api/geofences              ← active (public) / all (admin)
  *  POST   /api/geofences              ← admin create
@@ -64,7 +68,7 @@ const TELEGRAM_CHAT_ID  = process.env.TELEGRAM_CHAT_ID || '';
 const RETENTION_DAYS    = Math.max(1, parseInt(process.env.RETENTION_DAYS || '90', 10) || 90);
 const ONLINE_WINDOW_S   = 120;
 const STARTED           = Date.now();
-const VERSION           = '3.1';
+const VERSION           = '3.2';
 const SESS_COOKIE       = 'velocis_sess';
 const SESS_MAX_AGE_S    = 7 * 24 * 60 * 60;
 
@@ -116,7 +120,35 @@ db.exec(`
     limit_kph REAL NOT NULL,
     active    INTEGER NOT NULL DEFAULT 1
   );
+
+  CREATE TABLE IF NOT EXISTS track_points (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    device      TEXT    NOT NULL,
+    lat         REAL    NOT NULL,
+    lon         REAL    NOT NULL,
+    speed       REAL,
+    speed_limit REAL,
+    over        INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_track_dev_time ON track_points(device, recorded_at);
 `);
+
+// Additive column migrations for databases created by older versions.
+function addColumnIfMissing(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    console.log(`[DB]  Migrated: ${table}.${column}`);
+  }
+}
+// limit_kph/limit_mode: the device's configured limit. limit_rev bumps on each
+// dashboard edit; limit_ack_rev is the rev the device last confirmed applying.
+addColumnIfMissing('devices', 'limit_kph',     'REAL');
+addColumnIfMissing('devices', 'limit_mode',    "TEXT DEFAULT 'manual'");
+addColumnIfMissing('devices', 'limit_rev',     'INTEGER NOT NULL DEFAULT 0');
+addColumnIfMissing('devices', 'limit_ack_rev', 'INTEGER NOT NULL DEFAULT 0');
 
 const geofenceCount = db.prepare('SELECT COUNT(*) AS n FROM geofences').get().n;
 if (geofenceCount === 0) {
@@ -268,6 +300,45 @@ const stmtGeofencesVersion = db.prepare(`
 const stmtRetention = db.prepare(`
   DELETE FROM violations
   WHERE received_at < datetime('now', 'localtime', ?)
+`);
+
+const stmtTrackRetention = db.prepare(`
+  DELETE FROM track_points
+  WHERE recorded_at < datetime('now', 'localtime', ?)
+`);
+
+const stmtInsertTrack = db.prepare(`
+  INSERT INTO track_points (device, lat, lon, speed, speed_limit, over, recorded_at)
+  VALUES (@device, @lat, @lon, @speed, @speed_limit, @over, datetime('now', 'localtime', @offset))
+`);
+
+const stmtTrackForDevice = db.prepare(`
+  SELECT id, device, lat, lon, speed, speed_limit, over, recorded_at
+  FROM track_points
+  WHERE device = @device AND recorded_at >= datetime('now', 'localtime', @since)
+  ORDER BY recorded_at DESC, id DESC
+  LIMIT @limit
+`);
+
+const stmtTrackCounts = db.prepare(`
+  SELECT device, COUNT(*) AS points, MAX(recorded_at) AS last_point
+  FROM track_points
+  WHERE recorded_at >= datetime('now', 'localtime', '-24 hours')
+  GROUP BY device
+`);
+
+const stmtSetDeviceLimit = db.prepare(`
+  UPDATE devices SET limit_kph = @kph, limit_mode = @mode, limit_rev = limit_rev + 1
+  WHERE id = @id
+`);
+
+const stmtDeviceLimitReport = db.prepare(`
+  UPDATE devices SET
+    limit_kph     = @kph,
+    limit_mode    = @mode,
+    limit_ack_rev = @ack,
+    limit_rev     = MAX(limit_rev, @ack)
+  WHERE id = @id
 `);
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -440,6 +511,77 @@ function upsertDevicePresence(opts) {
   });
 }
 
+function normalizeMode(m) {
+  const s = String(m || '').toLowerCase();
+  return s === 'auto' || s === 'manual' ? s : null;
+}
+
+/**
+ * Two-way speed-limit sync, called on every device report (heartbeat / track).
+ * - Dashboard edit newer than what the device applied → return it for the device to apply.
+ * - Otherwise the device is authoritative: store what it reports (button/local web edits).
+ */
+function syncDeviceLimit(deviceId, body) {
+  const d = stmtGetDevice.get(String(deviceId));
+  if (!d) return null;
+
+  const devRev  = intOrNull(body.limit_rev) || 0;
+  const devKph  = numOrNull(body.limit_setting);
+  const devMode = normalizeMode(body.limit_mode);
+  const srvRev  = d.limit_rev || 0;
+
+  if (srvRev > devRev && d.limit_kph != null) {
+    return { kph: d.limit_kph, mode: d.limit_mode || 'manual', rev: srvRev };
+  }
+  if (devKph != null && devMode) {
+    stmtDeviceLimitReport.run({ id: d.id, kph: devKph, mode: devMode, ack: devRev });
+  }
+  return null;
+}
+
+function validLatLon(lat, lon) {
+  return Number.isFinite(lat) && Number.isFinite(lon) &&
+    lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
+    !(Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6);
+}
+
+function gmapsPointUrl(lat, lon) {
+  return `https://www.google.com/maps/search/?api=1&query=${(+lat).toFixed(6)},${(+lon).toFixed(6)}`;
+}
+
+/** Route through up to maxStops evenly sampled points (oldest → newest). */
+function gmapsRouteUrl(pointsAsc, maxStops = 10) {
+  if (!pointsAsc.length) return null;
+  if (pointsAsc.length === 1) return gmapsPointUrl(pointsAsc[0].lat, pointsAsc[0].lon);
+  const n = Math.min(maxStops, pointsAsc.length);
+  const picked = [];
+  for (let i = 0; i < n; i++) {
+    picked.push(pointsAsc[Math.round((i * (pointsAsc.length - 1)) / (n - 1))]);
+  }
+  return 'https://www.google.com/maps/dir/' +
+    picked.map((p) => `${(+p.lat).toFixed(6)},${(+p.lon).toFixed(6)}`).join('/');
+}
+
+/** Accepts { points: [...] } batches or a single { lat, lon, ... } point. */
+function parseTrackPoints(body) {
+  const raw = Array.isArray(body.points) ? body.points : [body];
+  const out = [];
+  for (const p of raw.slice(0, 200)) {
+    const lat = numOrNull(p.lat);
+    const lon = numOrNull(p.lon);
+    if (!validLatLon(lat, lon)) continue;
+    const speed = numOrNull(p.speed);
+    const limit = numOrNull(p.limit ?? p.speed_limit);
+    const age = Math.max(0, Math.min(7 * 86400, intOrNull(p.age_s) || 0));
+    out.push({
+      lat, lon, speed, speed_limit: limit,
+      over: speed != null && limit != null && speed > limit ? 1 : 0,
+      age,
+    });
+  }
+  return out;
+}
+
 function sendTelegramAlert(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
@@ -490,18 +632,29 @@ function enrichDevices(registryRows, violationAggs) {
   for (const v of violationAggs) {
     byId.set(v.device, v);
   }
+  const trackById = new Map(stmtTrackCounts.all().map((t) => [t.device, t]));
 
   const enriched = registryRows.map((d) => {
     const agg = byId.get(d.id) || {};
+    const tr = trackById.get(d.id) || {};
+    const hasPos = validLatLon(d.last_lat, d.last_lon);
+    const online = isOnline(d.last_seen);
     return {
       ...d,
       device: d.id,
-      online: isOnline(d.last_seen),
+      online,
       total_violations: agg.total_violations || 0,
       max_speed: agg.max_speed != null ? agg.max_speed : d.last_speed,
       severe: agg.severe || 0,
       label: d.label || d.id,
       vehicle: d.vehicle || null,
+      limit_mode: d.limit_mode || 'manual',
+      limit_pending: (d.limit_rev || 0) > (d.limit_ack_rev || 0),
+      over_limit: online && d.gps_valid !== 0 && d.last_speed != null && d.last_limit != null &&
+        d.last_speed > d.last_limit,
+      gmaps_url: hasPos ? gmapsPointUrl(d.last_lat, d.last_lon) : null,
+      track_points_24h: tr.points || 0,
+      last_track_at: tr.last_point || null,
     };
   });
 
@@ -637,7 +790,7 @@ app.post('/api/violation', (req, res) => {
         `Device: ${row.device}\n` +
         `Speed: ${row.speed} km/h (limit ${row.speed_limit})\n` +
         `Excess: +${row.excess}\n` +
-        (row.lat != null ? `Loc: ${row.lat}, ${row.lon}` : 'Loc: n/a');
+        (validLatLon(row.lat, row.lon) ? `Map: ${gmapsPointUrl(row.lat, row.lon)}` : 'Loc: n/a');
       sendTelegramAlert(msg);
     }
 
@@ -670,13 +823,94 @@ app.post('/api/heartbeat', (req, res) => {
       internet_ok: body.internet_ok,
     });
 
+    const limit = syncDeviceLimit(device, body);
     const version = geofencesVersion();
     const geofences = stmtActiveGeofences.all();
-    return res.json({ ok: true, geofences_version: version, geofences });
+    return res.json({ ok: true, geofences_version: version, geofences, ...(limit ? { limit } : {}) });
   } catch (err) {
     console.error('[heartbeat] error:', err.message);
     return res.status(500).json({ ok: false, error: 'Database error' });
   }
+});
+
+// ── GPS track log ───────────────────────────────────────────
+app.post('/api/track', (req, res) => {
+  const body = req.body || {};
+  const device = String(body.device || body.id || 'UNKNOWN');
+
+  const auth = authorizeDevice(req, device);
+  if (!auth.ok) return res.status(401).json({ ok: false, error: auth.error });
+
+  const points = parseTrackPoints(body);
+  try {
+    const insertAll = db.transaction((rows) => {
+      for (const p of rows) {
+        stmtInsertTrack.run({
+          device, lat: p.lat, lon: p.lon, speed: p.speed, speed_limit: p.speed_limit,
+          over: p.over, offset: `-${p.age} seconds`,
+        });
+      }
+    });
+    insertAll(points);
+
+    const known = stmtGetDevice.get(device);
+    if (!REQUIRE_AUTH || known || (DEVICE_API_KEY && getApiKey(req) === DEVICE_API_KEY)) {
+      const newest = points.reduce((a, p) => (!a || p.age < a.age ? p : a), null);
+      upsertDevicePresence({
+        id: device,
+        lat: newest ? newest.lat : null,
+        lon: newest ? newest.lon : null,
+        speed: newest ? newest.speed : body.speed,
+        limit: newest ? newest.speed_limit : body.limit,
+        gps_valid: newest ? 1 : body.gps_valid,
+      });
+    }
+
+    const limit = syncDeviceLimit(device, body);
+    return res.status(201).json({ ok: true, stored: points.length, ...(limit ? { limit } : {}) });
+  } catch (err) {
+    console.error('[track] error:', err.message);
+    return res.status(500).json({ ok: false, error: 'Database error' });
+  }
+});
+
+function queryTrack(req) {
+  const device = String(req.query.device || '').trim();
+  const hours = Math.max(1, Math.min(24 * 30, parseInt(req.query.hours || '24', 10) || 24));
+  const limit = Math.max(1, Math.min(20000, parseInt(req.query.limit || '2000', 10) || 2000));
+  const rows = device
+    ? stmtTrackForDevice.all({ device, since: `-${hours} hours`, limit })
+    : [];
+  return { device, hours, rows };
+}
+
+app.get('/api/track', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+  const { device, hours, rows } = queryTrack(req);
+  if (!device) return res.status(400).json({ ok: false, error: 'device is required' });
+  const asc = rows.slice().reverse();
+  return res.json({
+    ok: true,
+    device,
+    hours,
+    count: asc.length,
+    points: asc.map((p) => ({ ...p, gmaps_url: gmapsPointUrl(p.lat, p.lon) })),
+    route_url: gmapsRouteUrl(asc),
+  });
+});
+
+app.get('/api/track.csv', (req, res) => {
+  if (!requireViewer(req)) return unauthorized(res);
+  const { device, rows } = queryTrack(req);
+  if (!device) return res.status(400).json({ ok: false, error: 'device is required' });
+  const header = ['id', 'device', 'lat', 'lon', 'speed', 'speed_limit', 'over', 'recorded_at', 'google_maps'];
+  const lines = [header.join(',')];
+  for (const r of rows.slice().reverse()) {
+    lines.push(header.map((k) => csvEscape(k === 'google_maps' ? gmapsPointUrl(r.lat, r.lon) : r[k])).join(','));
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="track-${device}.csv"`);
+  return res.send(lines.join('\n'));
 });
 
 app.get('/api/violations', (req, res) => {
@@ -838,6 +1072,37 @@ app.patch('/api/devices/:id', (req, res) => {
   }
 });
 
+// Queued until the device's next heartbeat/track upload, which returns it.
+app.patch('/api/devices/:id/limit', (req, res) => {
+  if (!requireAdmin(req)) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  const id = String(req.params.id);
+  if (!stmtGetDevice.get(id)) return res.status(404).json({ ok: false, error: 'Not found' });
+
+  const body = req.body || {};
+  const kph = numOrNull(body.limit_kph ?? body.limit);
+  const mode = normalizeMode(body.mode ?? body.limit_mode) || 'manual';
+  if (kph == null || kph < 5 || kph > 250) {
+    return res.status(400).json({ ok: false, error: 'limit_kph must be between 5 and 250' });
+  }
+  try {
+    stmtSetDeviceLimit.run({ id, kph: Math.round(kph), mode });
+    const d = stmtGetDevice.get(id);
+    console.log(`[ADMIN] Limit for ${id} → ${Math.round(kph)} km/h (${mode}), rev ${d.limit_rev}`);
+    return res.json({
+      ok: true,
+      device: id,
+      limit_kph: d.limit_kph,
+      limit_mode: d.limit_mode,
+      limit_rev: d.limit_rev,
+      limit_pending: d.limit_rev > d.limit_ack_rev,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.delete('/api/devices/:id', (req, res) => {
   if (!requireAdmin(req)) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
@@ -943,8 +1208,9 @@ app.post('/api/retention', (req, res) => {
   const days = Math.max(1, parseInt((req.body && req.body.days) || RETENTION_DAYS, 10) || RETENTION_DAYS);
   try {
     const info = stmtRetention.run(`-${days} days`);
-    console.log(`[ADMIN] Retention purge: deleted ${info.changes} rows older than ${days} days`);
-    return res.json({ ok: true, deleted: info.changes, days });
+    const trackInfo = stmtTrackRetention.run(`-${days} days`);
+    console.log(`[ADMIN] Retention purge: deleted ${info.changes} violations, ${trackInfo.changes} track points older than ${days} days`);
+    return res.json({ ok: true, deleted: info.changes, track_deleted: trackInfo.changes, days });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
@@ -990,7 +1256,7 @@ app.use((req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n╔══════════════════════════════════════════╗`);
-  console.log(`║  Velocis Speed Monitor Server  v3.1      ║`);
+  console.log(`║  Velocis Speed Monitor Server  v${VERSION}      ║`);
   console.log(`╠══════════════════════════════════════════╣`);
   console.log(`║  Dashboard : http://localhost:${String(PORT).padEnd(5)}      ║`);
   console.log(`║  Health    : GET  /api/health            ║`);

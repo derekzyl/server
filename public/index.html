@@ -151,6 +151,36 @@
         </div>
 
         <div style="display:flex;flex-direction:column;gap:16px">
+          <!-- GPS Track Log Card -->
+          <div class="glass-panel">
+            <div class="panel-header">
+              <h3>🛰️ GPS Track Log</h3>
+              <span class="mono-cell" style="font-size:0.75rem;color:var(--text-muted)" id="trackCount">—</span>
+            </div>
+            <div class="panel-body" style="padding:14px;display:flex;flex-direction:column;gap:10px">
+              <div style="display:flex;gap:8px">
+                <select class="select-field" id="trackDevice" style="flex:1;min-width:0" onchange="loadTrack(true)">
+                  <option value="">Select device…</option>
+                </select>
+                <select class="select-field" id="trackHours" onchange="loadTrack(true)">
+                  <option value="1">1 h</option>
+                  <option value="6">6 h</option>
+                  <option value="24" selected>24 h</option>
+                  <option value="72">3 days</option>
+                  <option value="168">7 days</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn btn-primary btn-sm" type="button" id="trackToggleBtn" onclick="toggleTrack()">Show on map</button>
+                <a class="btn btn-ghost btn-sm" id="trackGmaps" href="#" target="_blank" rel="noopener" style="display:none">Open route in Google Maps ↗</a>
+                <a class="btn btn-ghost btn-sm" id="trackCsv" href="#" style="display:none">CSV</a>
+              </div>
+              <div id="trackSummary" style="font-size:0.75rem;color:var(--text-muted)">
+                The device logs a point every 5 s while moving (every 60 s when parked) and uploads them when it has internet.
+              </div>
+            </div>
+          </div>
+
           <!-- 24-Hour Sparkline Card -->
           <div class="glass-panel">
             <div class="panel-header">
